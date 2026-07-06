@@ -3,8 +3,7 @@
 const statusEl = document.getElementById("status");
 const startBtn = document.getElementById("start");
 const stopBtn = document.getElementById("stop");
-const autoStartedEl = document.getElementById("auto-started");
-const autoStartCheckbox = document.getElementById("auto-start-on-install");
+const runningTagEl = document.getElementById("running-tag");
 
 // Show the loaded build's version (from the manifest, so it always reflects
 // whatever the auto-reloader actually has loaded).
@@ -14,24 +13,22 @@ function setStatus(text) {
   if (text) statusEl.textContent = text;
 }
 
-function setAutoStarted(show) {
-  autoStartedEl.hidden = !show;
+// Reflects state.sessionActive, which the service worker keeps ONLY in
+// chrome.storage.session (in-memory, cleared when the browser closes) — never
+// chrome.storage.local — so "Running" never survives past a real browser
+// restart, matching a live run rather than a persisted flag.
+function setRunningTag(show) {
+  runningTagEl.hidden = !show;
 }
 
 startBtn.addEventListener("click", () => {
   chrome.runtime.sendMessage({ type: "start" });
-  setAutoStarted(false);
   setStatus("Starting…");
 });
 
 stopBtn.addEventListener("click", () => {
   chrome.runtime.sendMessage({ type: "stop" });
-  setAutoStarted(false);
   setStatus("Stopping…");
-});
-
-autoStartCheckbox.addEventListener("change", () => {
-  chrome.storage.local.set({ autoStartOnInstall: autoStartCheckbox.checked });
 });
 
 // Live status pushed by the service worker while the popup is open.
@@ -39,21 +36,11 @@ chrome.runtime.onMessage.addListener((req) => {
   if (req.type === "status") setStatus(req.text);
 });
 
-chrome.storage.local.get(["autoStarted", "autoStartOnInstall"], ({ autoStarted, autoStartOnInstall }) => {
-  setAutoStarted(!!autoStarted);
-  autoStartCheckbox.checked = autoStartOnInstall !== false; // default ON
-});
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes.autoStarted) return;
-  setAutoStarted(!!changes.autoStarted.newValue);
-});
-
 // Reflect current run state when the popup opens.
 chrome.runtime.sendMessage({ type: "get-state" }, (res) => {
   if (chrome.runtime.lastError) return; // worker asleep; leave default text
-  if (res?.autoStarted) setAutoStarted(true);
   if (res?.running) setStatus(`Running… (${res.retries} bounces so far)`);
+  setRunningTag(!!res?.sessionActive);
 });
 
 // --- debug panel: live state, polled while the popup stays open ---------
@@ -77,6 +64,7 @@ const POLL_MS = 1000;
 
 function renderDebug(res) {
   if (!res) return;
+  setRunningTag(!!res.sessionActive);
   const phase = res.running ? "redirecting" : res.sessionActive ? "funnel" : "idle";
   dbg.phase.textContent = phase;
   dbg.phase.className = `v ${phase === "idle" ? "" : `phase-${phase}`}`;

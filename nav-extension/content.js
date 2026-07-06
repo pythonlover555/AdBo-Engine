@@ -34,9 +34,6 @@
  * STEP 6: progress-slider interstitial (#step-slider-cont / .slider-stepper) ->
  *   don't touch it; WAIT until it disappears, then route to the next step.
  *
- * STEP 7: SMS opt-in overlay (#sms-whitebox) -> type "TEXT" into #text-confirm,
- *   click .sms-btn Confirm. Can appear on top of other funnel pages at any time.
- *
  * The identity (name + e-mail) AND the details are each fetched ONCE per run by
  * the service worker and reused, so every funnel page shares the same person.
  */
@@ -197,6 +194,40 @@ function clickElement(el) {
   }
 }
 
+// Some funnel pages gate their Continue/submit handler behind a guard that
+// isn't ready the instant the page renders, e.g. the email step's Continue:
+//   onclick="if (!window.__cfRLUnblockHandlers) return false; submitCid()"
+// (a Cloudflare rate-limit guard) — so the very first click can be a silent
+// no-op. Retry periodically instead of firing once and hoping.
+const CLICK_RETRY_TRIES = 4; // 1 initial click + up to 3 retries
+const CLICK_RETRY_INTERVAL_MS = 2000;
+
+// Click a "Continue"/submit-style control and confirm it actually took
+// effect, re-clicking periodically if not. A successful click is assumed to
+// make the control disappear or go invisible (navigation, form replaced,
+// button hidden/disabled) — so we keep re-clicking while `getEl()` still
+// resolves to a visible element, up to CLICK_RETRY_TRIES attempts. `getEl`
+// re-resolves the target each retry (not a stale reference) in case the page
+// re-renders it. Flags only if the control is still visible after every try.
+async function clickAndConfirm(getEl, label) {
+  for (let attempt = 1; attempt <= CLICK_RETRY_TRIES; attempt++) {
+    const el = getEl();
+    if (!el || !isVisible(el)) {
+      if (attempt > 1) log(`${label}: gone after ${attempt - 1} click(s)`);
+      return true;
+    }
+    clickElement(el);
+    log(`clicked ${label}${attempt > 1 ? ` (retry ${attempt - 1})` : ""}`);
+    if (attempt < CLICK_RETRY_TRIES) await sleep(CLICK_RETRY_INTERVAL_MS);
+  }
+  const stillThere = getEl();
+  if (stillThere && isVisible(stillThere)) {
+    flag(`${label}: still visible after ${CLICK_RETRY_TRIES} click attempts`);
+    return false;
+  }
+  return true;
+}
+
 async function getIdentity() {
   const res = await chrome.runtime.sendMessage({ type: "get-identity" });
   if (!res?.ok) throw new Error(res?.error || "no identity from server");
@@ -299,13 +330,12 @@ async function emailStep() {
   // which contain BOTH the input and the button) so we click THIS form's button,
   // not some other .cid-btns on the page.
   const scope = input.closest(".cta-box, #cid-main-container") || document;
-  const cont = findContinue(scope) || findContinue();
-  if (!cont) {
+  const findCont = () => findContinue(scope) || findContinue();
+  if (!findCont()) {
     flag("email step: Continue control not found");
     return true;
   }
-  clickElement(cont);
-  log("clicked Continue");
+  await clickAndConfirm(findCont, "email Continue");
   return true;
 }
 
@@ -363,13 +393,12 @@ async function registrationStep() {
   await humanPause(); // review pause before submitting
   // Submit is the specific #sub-btn; only if that's missing fall back to a
   // Continue control SCOPED to this form (never a button elsewhere on the page).
-  const submit = document.getElementById("sub-btn") || findContinue(root);
-  if (!submit) {
+  const findSubmit = () => document.getElementById("sub-btn") || findContinue(root);
+  if (!findSubmit()) {
     flag("registration: submit (#sub-btn) not found");
     return true;
   }
-  clickElement(submit);
-  log("clicked Continue (registration submitted)");
+  await clickAndConfirm(findSubmit, "registration submit");
   return true;
 }
 
@@ -597,10 +626,9 @@ async function answerMultiSelect(block, qText, options) {
 
   // Submit the multi-select (Done/Submit). Auto-advancing ones won't have one.
   await humanPause();
-  const submit = findMultiSubmit(block);
-  if (submit) {
-    clickElement(submit);
-    log("survey (multi): submitted");
+  const findSubmit = () => findMultiSubmit(block);
+  if (findSubmit()) {
+    await clickAndConfirm(findSubmit, "survey multi-select submit");
   } else {
     flag("multi-select: Done/Submit control not found");
   }
@@ -651,9 +679,9 @@ async function surveyStep() {
   // (auto-advancing ones simply won't have one — clicking nothing is fine).
   const next = findAdvanceButton();
   if (next) {
+    const label = `survey advance (${(next.textContent || "advance").trim()})`;
     await humanPause();
-    clickElement(next);
-    log("survey: clicked", (next.textContent || "advance").trim());
+    await clickAndConfirm(findAdvanceButton, label);
   }
   return true;
 }
@@ -715,42 +743,8 @@ async function tcpaConfirmStep() {
   }
 
   await humanPause();
-  clickElement(submit); // its inline onclick runs survey.submit()
-  log("tcpa: clicked Continue");
-  return true;
-}
-
-// --- STEP 7: SMS opt-in overlay (#sms-whitebox) -----------------------
-// "Type in TEXT below to confirm your opt in." — fill #text-confirm, click Confirm.
-function smsPopupShown() {
-  const box = document.getElementById("sms-whitebox");
-  return box && isVisible(box);
-}
-
-async function smsConfirmStep() {
-  const box = document.getElementById("sms-whitebox");
-  if (!box || !isVisible(box)) return false;
-  if (box.dataset.condNavDone === "1") return true;
-  box.dataset.condNavDone = "1";
-
-  const input = document.getElementById("text-confirm");
-  if (!input) {
-    flag("sms: #text-confirm not found");
-    return true;
-  }
-
-  await humanPause();
-  await typeInto(input, "TEXT");
-  log('sms: typed "TEXT"');
-
-  await humanPause();
-  const confirm = box.querySelector(".sms-btn");
-  if (!confirm) {
-    flag("sms: Confirm button (.sms-btn) not found");
-    return true;
-  }
-  clickElement(confirm); // inline onclick runs submitCid()
-  log("sms: clicked Confirm");
+  // its inline onclick runs survey.submit()
+  await clickAndConfirm(() => document.getElementById("tcpaSubBtn"), "tcpa Continue");
   return true;
 }
 
@@ -758,12 +752,12 @@ async function smsConfirmStep() {
 async function ctaYesStep() {
   const cid = document.getElementById("cidmain"); // not "main" — that's the router fn
   if (!cid) return false;
-  const yes =
+  const findYes = () =>
     cid.querySelector(".yes_btn") ||
     [...cid.querySelectorAll("div, button, a")].find((el) =>
       /^yes!?$/i.test((el.textContent || "").trim())
     );
-  if (!yes) {
+  if (!findYes()) {
     flag("cta (#cidmain): 'Yes!' button not found");
     return false;
   }
@@ -771,8 +765,8 @@ async function ctaYesStep() {
   cid.dataset.condNavDone = "1";
 
   await humanPause();
-  clickElement(yes); // inline onclick runs showEmPop()
-  log(`cta: clicked Yes! — waiting ${POST_YES_WAIT_MS / 1000}s for the next step…`);
+  await clickAndConfirm(findYes, "cta Yes!"); // inline onclick runs showEmPop()
+  log(`cta: waiting ${POST_YES_WAIT_MS / 1000}s for the next step…`);
 
   // "Yes!" opens an email popup / kicks off the next step; wait a fixed 30s
   // before doing anything else, then route to whatever is shown next (unless the
@@ -822,12 +816,6 @@ async function reviewingProgressStep() {
 const FUNNEL_ANCHORS =
   "#reg-container, .SurveyQue, #tcpaSubBtn, #cidmain, #step-slider-cont, .slider-stepper, #user-email, .cid-btns, input[type=email][name=email]";
 
-// First visible funnel anchor (SMS overlay takes priority when shown).
-function firstFunnelAnchor() {
-  if (smsPopupShown()) return document.getElementById("sms-whitebox");
-  return document.querySelector(FUNNEL_ANCHORS);
-}
-
 // Is a funnel run active right now? We run on <all_urls>, so this gate keeps the
 // automation from touching forms on unrelated sites the user happens to visit —
 // it only acts between Start and Stop.
@@ -848,7 +836,7 @@ async function main() {
 
   // Wait ONCE for any known page anchor to render, then route to exactly one
   // step — so a survey page doesn't sit through the email/registration waits.
-  const anchor = await waitForCondition(firstFunnelAnchor, 8000);
+  const anchor = await waitForCondition(() => document.querySelector(FUNNEL_ANCHORS), 8000);
   if (!anchor) {
     // We run in EVERY frame (all_frames) on EVERY site (all_urls), so most
     // frames legitimately have no funnel anchor — only flag it on the top frame.
@@ -857,9 +845,6 @@ async function main() {
   }
 
   heartbeatActive = true; // confirmed funnel page -> keep the worker's stall clock alive
-
-  // Overlays that sit on top of other funnel UI — handle first.
-  if (smsPopupShown()) return void (await smsConfirmStep());
 
   // Single-purpose pages.
   if (document.querySelector("#step-slider-cont, .slider-stepper")) {
@@ -903,18 +888,6 @@ setInterval(() => {
   if (!heartbeatActive) return;
   if (window !== window.top) return; // one heartbeat per page, from the top frame
   chrome.runtime.sendMessage({ type: "heartbeat" }).catch(() => {});
-  if (smsPopupShown()) smsConfirmStep().catch(() => {});
 }, HEARTBEAT_MS);
-
-// The SMS overlay can appear at any point without navigation; poll while a run is
-// active so we still catch it if no other funnel anchor was on the page yet.
-const SMS_POLL_MS = 2000;
-setInterval(async () => {
-  if (window !== window.top) return;
-  if (!(await isSessionActive())) return;
-  if (!smsPopupShown()) return;
-  heartbeatActive = true;
-  await smsConfirmStep();
-}, SMS_POLL_MS);
 
 main();

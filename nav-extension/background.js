@@ -61,15 +61,38 @@ const STALL_TIMEOUT_MS = 90000; // no progress this long => force a fresh restar
 const UPDATE_ALARM = "cond-nav-update-check";
 const UPDATE_CHECK_MIN = 0.5; // ~30s poll (MV3 min alarm period)
 
-// Durable auto-start poll: while enabled, periodically check whether a run is
-// active and start one if not. Does not rely on window-open events (unreliable
-// when many profiles launch at once or the service worker wakes late).
-const AUTO_START_ALARM = "cond-nav-auto-start";
-const AUTO_START_POLL_MIN = 0.17; // ~10s between checks (MV3 one-shot reschedule floor)
+// --- remote start (terminal-triggerable) --------------------------------
+//
+// The server (see server/main.py) holds one counter. Bumping it from a
+// terminal (curl -X POST http://localhost:8137/api/trigger-start) is the
+// whole "command" — every open browser's extension polls it on this alarm
+// and starts a run if the number changed AND it isn't already running.
+// Already-running instances are left alone, not interrupted.
+const START_CHECK_ALARM = "cond-nav-start-check";
+const START_CHECK_MIN = 0.17; // ~10s between checks
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-let autoStartRunning = false; // guard against overlapping poll ticks
+async function checkStartSignal() {
+  let signal;
+  try {
+    const resp = await fetch(`${SERVER}/api/start-signal`, { cache: "no-store" });
+    if (!resp.ok) return;
+    ({ signal } = await resp.json());
+  } catch {
+    return; // server unreachable — nothing to act on
+  }
+  if (!signal) return;
+
+  const { lastStartSignal } = await chrome.storage.local.get("lastStartSignal");
+  if (signal === lastStartSignal) return; // already handled this one
+  await chrome.storage.local.set({ lastStartSignal: signal });
+
+  if (state.sessionActive) return; // already running — leave it alone
+
+  status(`Remote start (signal #${signal}) — starting…`, "run");
+  await start();
+}
 
 // --- run state --------------------------------------------------------
 //
@@ -143,15 +166,15 @@ async function getSourceUrl() {
   return SOURCE_URL;
 }
 
-async function start({ auto = false, tab = null } = {}) {
+async function start() {
   await stop(); // clear any prior run first
 
   // Drive the CURRENT tab (don't open a new one): navigate the active tab to
   // the source URL and run the whole funnel in place.
-  const active = tab || (await findDriveTab());
-  if (!active?.id) {
+  const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!active) {
     status("No active tab to drive.", "fail");
-    return false;
+    return;
   }
   const sourceUrl = await getSourceUrl(); // from .env via /api/config (or fallback)
   // Fresh run => drop the previous identity so a new one is issued on the
@@ -169,105 +192,13 @@ async function start({ auto = false, tab = null } = {}) {
     recoveries: 0,
   };
   await chrome.storage.local.remove(["identity", "details"]);
-  if (auto) {
-    await chrome.storage.local.set({ autoStarted: true });
-  } else {
-    await chrome.storage.local.remove("autoStarted");
-  }
   await persist();
   // Arm the durable watchdog for the life of this run (create replaces any
   // existing alarm of the same name, so there's never a duplicate).
   await chrome.alarms.create(WATCHDOG_ALARM, { periodInMinutes: WATCHDOG_PERIOD_MIN });
   await chrome.tabs.update(active.id, { url: sourceUrl });
-  status(
-    auto ? "Auto started — loading source URL in this tab…" : "Started — loading source URL in this tab…",
-    "run"
-  );
-  return true;
+  status("Started — loading source URL in this tab…", "run");
 }
-
-// When enabled (popup checkbox, default ON), pick a tab to drive.
-async function findDriveTab() {
-  const [focused] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (focused?.id) return focused;
-  const wins = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
-  for (const w of wins) {
-    const tab = w.tabs?.find((t) => t.active);
-    if (tab?.id) return tab;
-  }
-  return null;
-}
-
-async function drivenTabExists() {
-  if (state.tabId == null) return false;
-  try {
-    await chrome.tabs.get(state.tabId);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function isRunActive() {
-  await restore();
-  return state.sessionActive && state.running && (await drivenTabExists());
-}
-
-async function tryAutoStart() {
-  if (autoStartRunning) return;
-  autoStartRunning = true;
-  try {
-    const { autoStartOnInstall } = await chrome.storage.local.get("autoStartOnInstall");
-    if (autoStartOnInstall === false) return;
-
-    if (await isRunActive()) return;
-
-    log("auto-start poll: not running — starting");
-
-    for (let i = 0; i < 12; i++) {
-      const tab = await findDriveTab();
-      if (tab?.id) {
-        const ok = await start({ auto: true, tab });
-        if (ok) return;
-      }
-      await sleep(500);
-    }
-
-    log("auto-start poll: no tab found — creating one");
-    try {
-      const tab = await chrome.tabs.create({ url: "about:blank", active: true });
-      await start({ auto: true, tab });
-    } catch (e) {
-      log("auto-start poll: tab create/start failed:", e);
-    }
-  } finally {
-    autoStartRunning = false;
-  }
-}
-
-// Arm a repeating poll while auto-start is enabled; clear it when disabled.
-async function syncAutoStartPoll() {
-  const { autoStartOnInstall } = await chrome.storage.local.get("autoStartOnInstall");
-  if (autoStartOnInstall === false) {
-    await chrome.alarms.clear(AUTO_START_ALARM);
-    log("auto-start poll: disabled");
-    return;
-  }
-  await chrome.alarms.create(AUTO_START_ALARM, { periodInMinutes: AUTO_START_POLL_MIN });
-  log(`auto-start poll: armed (every ~${Math.round(AUTO_START_POLL_MIN * 60)}s)`);
-}
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== "local" || !changes.autoStartOnInstall) return;
-  syncAutoStartPoll();
-  if (changes.autoStartOnInstall.newValue !== false) tryAutoStart();
-});
-
-chrome.runtime.onInstalled.addListener((details) => {
-  if (details.reason !== "install" && details.reason !== "update") return;
-  syncAutoStartPoll();
-  tryAutoStart();
-});
 
 async function stop() {
   state.running = false;
@@ -539,7 +470,6 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   if (req.type === "stop") {
     state.sessionActive = false; // user ended the run -> content script goes inert
     chrome.alarms.clear(WATCHDOG_ALARM); // the ONLY place the watchdog is torn down
-    chrome.storage.local.remove("autoStarted");
     stop().then(() => {
       status("Stopped by user.", "info");
       sendResponse?.({ ok: true });
@@ -565,23 +495,20 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
     return true; // async
   }
   if (req.type === "get-state") {
-    chrome.storage.local.get("autoStarted").then(({ autoStarted }) => {
-      sendResponse?.({
-        running: state.running,
-        sessionActive: state.sessionActive,
-        tabId: state.tabId,
-        retries: state.retries,
-        unknown: state.unknown,
-        recoveries: state.recoveries,
-        lastProgressAt: state.lastProgressAt,
-        stallTimeoutMs: STALL_TIMEOUT_MS,
-        hasIdentity: !!state.identity,
-        hasDetails: !!state.details,
-        sourceUrl: state.sourceUrl,
-        autoStarted: !!autoStarted,
-      });
+    sendResponse?.({
+      running: state.running,
+      sessionActive: state.sessionActive,
+      tabId: state.tabId,
+      retries: state.retries,
+      unknown: state.unknown,
+      recoveries: state.recoveries,
+      lastProgressAt: state.lastProgressAt,
+      stallTimeoutMs: STALL_TIMEOUT_MS,
+      hasIdentity: !!state.identity,
+      hasDetails: !!state.details,
+      sourceUrl: state.sourceUrl,
     });
-    return true; // async
+    return; // sync
   }
 });
 
@@ -594,7 +521,7 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
 // landings. Keyed off sessionActive, so it runs from Start until the user Stops.
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === UPDATE_ALARM) return void checkForUpdate();
-  if (alarm.name === AUTO_START_ALARM) return void tryAutoStart();
+  if (alarm.name === START_CHECK_ALARM) return void checkStartSignal();
   if (alarm.name !== WATCHDOG_ALARM) return;
   await restore(); // rehydrate in-memory state after a possible eviction
   if (!state.sessionActive) {
@@ -676,8 +603,8 @@ restore();
 chrome.alarms.create(UPDATE_ALARM, { periodInMinutes: UPDATE_CHECK_MIN });
 checkForUpdate();
 
-// Arm the auto-start poll and check immediately on every worker wake.
-syncAutoStartPoll();
-tryAutoStart();
+// Remote start: keep the signal-poll alarm alive and check once now.
+chrome.alarms.create(START_CHECK_ALARM, { periodInMinutes: START_CHECK_MIN });
+checkStartSignal();
 
 log("service worker loaded");

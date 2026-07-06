@@ -6,6 +6,12 @@ local server for the data it fills into the sign-up funnel:
   GET /api/details   -> the rest of the registration form (address, phone,
                         DOB, gender) — everything except email/name
 
+It also lets you remote-start every open browser's extension from a
+terminal, with no extra script needed:
+  curl -X POST http://localhost:8137/api/trigger-start
+Every open browser polls GET /api/start-signal every ~10-30s; whichever ones
+are currently idle start a run, already-running ones are left alone.
+
 Run:  python run_server.py     (or: uvicorn server.main:app --port 8137)
 """
 from __future__ import annotations
@@ -21,7 +27,7 @@ from .logging_setup import get_logger
 
 # Project version. Format x.x.x.x; bump the last segment per release
 # (1.0.0.0 -> 1.0.0.1 -> ...). Keep in sync with nav-extension/manifest.json.
-VERSION = "1.0.0.33"
+VERSION = "1.0.0.28"
 
 log = get_logger("main")
 
@@ -86,6 +92,29 @@ async def details() -> dict[str, Any]:
         f"{d['dob']['year']}-{d['dob']['month']}-{d['dob']['day']}", d["gender"],
     )
     return {"ok": True, "details": d}
+
+
+# --- remote start (terminal-triggerable) --------------------------------
+#
+# A single in-memory counter. Bumping it is the whole "command": every open
+# browser's extension polls GET /api/start-signal on its own alarm and starts
+# a run if the number it sees is new AND it isn't already running.
+_start_signal = 0
+
+
+@app.get("/api/start-signal")
+async def start_signal() -> dict[str, Any]:
+    return {"ok": True, "signal": _start_signal}
+
+
+@app.post("/api/trigger-start")
+async def trigger_start() -> dict[str, Any]:
+    """Bump the start signal. curl -X POST this from a terminal to make every
+    currently-idle open browser start a run within ~10-30s."""
+    global _start_signal
+    _start_signal += 1
+    log.info("trigger-start: signal=%s", _start_signal)
+    return {"ok": True, "signal": _start_signal}
 
 
 if __name__ == "__main__":

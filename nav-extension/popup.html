@@ -11,23 +11,13 @@
         font: 13px/1.45 system-ui, sans-serif;
       }
       h1 { font-size: 14px; margin: 0 0 2px; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
-      .auto-tag {
+      .running-tag {
         font-size: 10px;
         font-weight: 600;
-        color: #6366f1;
+        color: #16a34a;
         letter-spacing: 0.02em;
       }
-      .auto-tag[hidden] { display: none; }
-      label.opt {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        margin: 0 0 10px;
-        font-size: 11px;
-        color: #6b7280;
-        cursor: pointer;
-        user-select: none;
-      }
+      .running-tag[hidden] { display: none; }
       p.sub { margin: 0 0 12px; color: #6b7280; font-size: 11px; word-break: break-all; }
       .row { display: flex; gap: 8px; margin-bottom: 12px; }
       button {
@@ -81,12 +71,8 @@
     </style>
   </head>
   <body>
-    <h1>Conditional Navigation <span id="auto-started" class="auto-tag" hidden>Auto Started</span></h1>
+    <h1>Conditional Navigation <span id="running-tag" class="running-tag" hidden>Running</span></h1>
     <p class="sub">Loops the source URL past google.com until it lands on uplevelrewards.com, then scrapes.</p>
-    <label class="opt">
-      <input type="checkbox" id="auto-start-on-install" checked />
-      Auto-start while not running (polls every ~10s)
-    </label>
     <div class="row">
       <button id="start">Start</button>
       <button id="stop">Stop</button>
