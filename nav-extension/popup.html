@@ -59,7 +59,25 @@
       }
       @media (prefers-color-scheme: dark) {
         #status { background: #1f2937; color: #e5e7eb; }
+        #debug { background: #1f2937; color: #e5e7eb; }
+        #debug .k { color: #9ca3af; }
       }
+      #debug {
+        margin-top: 10px;
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: #f3f4f6;
+        font-size: 11px;
+        display: grid;
+        grid-template-columns: auto 1fr;
+        column-gap: 8px;
+        row-gap: 3px;
+      }
+      #debug .k { color: #6b7280; }
+      #debug .v { text-align: right; font-variant-numeric: tabular-nums; }
+      #debug .v.flag { color: #ef4444; font-weight: 600; }
+      #debug .v.phase-funnel { color: #16a34a; font-weight: 600; }
+      #debug .v.phase-redirecting { color: #6366f1; font-weight: 600; }
     </style>
   </head>
   <body>
@@ -74,6 +92,15 @@
       <button id="stop">Stop</button>
     </div>
     <div id="status">Idle.</div>
+    <div id="debug">
+      <span class="k">phase</span><span class="v" id="dbg-phase">—</span>
+      <span class="k">idle</span><span class="v" id="dbg-idle">—</span>
+      <span class="k">retries</span><span class="v" id="dbg-retries">—</span>
+      <span class="k">unknown</span><span class="v" id="dbg-unknown">—</span>
+      <span class="k">recoveries</span><span class="v" id="dbg-recoveries">—</span>
+      <span class="k">identity</span><span class="v" id="dbg-identity">—</span>
+      <span class="k">tabId</span><span class="v" id="dbg-tabid">—</span>
+    </div>
     <div id="version"></div>
     <script src="popup.js"></script>
   </body>

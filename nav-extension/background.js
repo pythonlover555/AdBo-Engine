@@ -566,7 +566,20 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
   }
   if (req.type === "get-state") {
     chrome.storage.local.get("autoStarted").then(({ autoStarted }) => {
-      sendResponse?.({ running: state.running, retries: state.retries, autoStarted: !!autoStarted });
+      sendResponse?.({
+        running: state.running,
+        sessionActive: state.sessionActive,
+        tabId: state.tabId,
+        retries: state.retries,
+        unknown: state.unknown,
+        recoveries: state.recoveries,
+        lastProgressAt: state.lastProgressAt,
+        stallTimeoutMs: STALL_TIMEOUT_MS,
+        hasIdentity: !!state.identity,
+        hasDetails: !!state.details,
+        sourceUrl: state.sourceUrl,
+        autoStarted: !!autoStarted,
+      });
     });
     return true; // async
   }
