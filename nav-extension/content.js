@@ -72,6 +72,23 @@ function flag(...args) {
   console.warn("[cond-nav] ⚠ UNEXPECTED:", ...args);
 }
 
+// Ask the service worker whether this run should simulate a bored user leaving
+// the funnel at `phase`. Returns true if dropout was triggered.
+async function maybeDropout(phase, extra = {}) {
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "funnel-check", phase, ...extra });
+    if (res?.dropout) {
+      log(`simulated boredom dropout after ${phase}`);
+      heartbeatActive = false;
+      await chrome.runtime.sendMessage({ type: "funnel-dropout", phase });
+      return true;
+    }
+  } catch {
+    /* background unreachable — continue the funnel */
+  }
+  return false;
+}
+
 // Wait for an element to appear (the page may still be hydrating).
 async function waitFor(selector, timeout = 8000) {
   return waitForCondition(() => document.querySelector(selector), timeout);
@@ -199,7 +216,7 @@ function clickElement(el) {
 //   onclick="if (!window.__cfRLUnblockHandlers) return false; submitCid()"
 // (a Cloudflare rate-limit guard) — so the very first click can be a silent
 // no-op. Retry periodically instead of firing once and hoping.
-const CLICK_RETRY_TRIES = 4; // 1 initial click + up to 3 retries
+const CLICK_RETRY_TRIES = 100; // 1 initial click + up to 99 retries
 const CLICK_RETRY_INTERVAL_MS = 2000;
 
 // Click a "Continue"/submit-style control and confirm it actually took
@@ -336,6 +353,7 @@ async function emailStep() {
     return true;
   }
   await clickAndConfirm(findCont, "email Continue");
+  if (await maybeDropout("email")) return true;
   return true;
 }
 
@@ -399,6 +417,7 @@ async function registrationStep() {
     return true;
   }
   await clickAndConfirm(findSubmit, "registration submit");
+  if (await maybeDropout("registration")) return true;
   return true;
 }
 
@@ -666,6 +685,7 @@ async function surveyStep() {
     if (!block) break; // no more questions appeared
     await answerSurveyQuestion(block);
     answered++;
+    if (await maybeDropout("survey", { questionsAnswered: answered })) return true;
     // No extra pause here: the per-question 1–5s interval is the pause INSIDE
     // answerSurveyQuestion (before the click), and the loop top waits for the
     // next question to be revealed.
@@ -683,6 +703,7 @@ async function surveyStep() {
     await humanPause();
     await clickAndConfirm(findAdvanceButton, label);
   }
+  if (await maybeDropout("survey_complete")) return true;
   return true;
 }
 
@@ -745,6 +766,7 @@ async function tcpaConfirmStep() {
   await humanPause();
   // its inline onclick runs survey.submit()
   await clickAndConfirm(() => document.getElementById("tcpaSubBtn"), "tcpa Continue");
+  if (await maybeDropout("tcpa")) return true;
   return true;
 }
 

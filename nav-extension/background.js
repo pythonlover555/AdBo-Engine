@@ -18,11 +18,12 @@
 
 // --- configuration ----------------------------------------------------
 
-// FALLBACK source URL. The real one is fetched from the server (/api/config,
-// driven by ADBO_SOURCE_URL in .env) at Start; this is used only if the server
-// is unreachable. Keep it roughly in sync with the server default.
+// FALLBACK source URL. The real list is fetched from the server (/api/config,
+// driven by ADBO_SOURCE_URL_N in .env) before each redirect navigation; this is used only if the
+// server is unreachable. Keep it roughly in sync with the server default.
 const SOURCE_URL =
   "https://glstrk.com/?offer_ids=MTQyMSwyMzcw&affiliate_id=MTkwMjMw";
+const DEFAULT_SUCCESS_RATE = 100; // percent of runs that reach the reward page
 const FAILURE_SUBSTR = "google.com"; // any URL containing this = bounce
 const SUCCESS_SUBSTR = "uplevelrewards.com"; // any URL containing this = landed
 const REWARD_SUBSTR = "eward4spot.com"; // funnel finished here -> loop again
@@ -30,7 +31,8 @@ const REWARD_SUBSTR = "eward4spot.com"; // funnel finished here -> loop again
 const SERVER = "http://localhost:8137"; // local FastAPI server (must match server ADBO_PORT)
 
 const RETRY_DELAY_MS = 2000; // pause before re-navigating after a bounce
-const RESTART_DELAY_MS = 4000; // pause on the reward page before looping again
+const RESTART_DELAY_MS = 4000; // pause after a mid-funnel dropout before the next source URL
+const REWARD_PAGE_DELAY_MS = 60000; // pause on the reward page before looping again
 const SETTLE_MS = 1500; // quiet window after the last hop before we judge
 const MAX_RETRIES = 50; // safety cap on google bounces (infinite-loop guard)
 const MAX_UNKNOWN = 12; // safety cap on settles that match neither pattern
@@ -110,7 +112,11 @@ let state = {
   unknown: 0, // consecutive settles matching neither pattern
   identity: null, // the name+email this run fills into the funnel (one per run)
   details: null, // address/phone/DOB/gender for the registration page (one per run)
-  sourceUrl: SOURCE_URL, // resolved from the server (/api/config) at Start
+  sourceUrls: [SOURCE_URL], // all URLs from /api/config (cycled one per funnel run)
+  sourceUrlIndex: 0, // round-robin cursor into sourceUrls
+  sourceUrl: SOURCE_URL, // the URL for the current funnel attempt
+  successRate: DEFAULT_SUCCESS_RATE, // target % of runs that reach the reward page
+  funnelPlan: null, // per-run plan: complete vs dropout point (set on landing)
   lastProgressAt: 0, // ms epoch of the last sign of forward motion (watchdog clock)
   recoveries: 0, // how many times the watchdog has revived this run
 };
@@ -151,19 +157,66 @@ function status(text, kind = "info") {
 
 // --- lifecycle --------------------------------------------------------
 
-// Resolve the source URL from the server (.env-driven), falling back to the
-// hardcoded SOURCE_URL if the server is unreachable or doesn't provide one.
-async function getSourceUrl() {
+// Resolve runtime config from the server (.env-driven), with hardcoded fallbacks.
+async function getConfig() {
+  const fallback = { sourceUrls: [SOURCE_URL], successRate: DEFAULT_SUCCESS_RATE };
   try {
     const resp = await fetch(`${SERVER}/api/config`);
     if (resp.ok) {
       const data = await resp.json();
-      if (data?.source_url) return data.source_url;
+      const urls =
+        data?.source_urls?.length > 0
+          ? data.source_urls
+          : data?.source_url
+            ? [data.source_url]
+            : fallback.sourceUrls;
+      const rate =
+        typeof data?.success_rate === "number" && !Number.isNaN(data.success_rate)
+          ? data.success_rate
+          : fallback.successRate;
+      return { sourceUrls: urls, successRate: Math.max(0, Math.min(100, rate)) };
     }
   } catch {
     /* server down — use the fallback below */
   }
-  return SOURCE_URL;
+  return fallback;
+}
+
+// Advance to the next source URL in the round-robin list.
+function advanceSourceUrl() {
+  const urls = state.sourceUrls?.length ? state.sourceUrls : [SOURCE_URL];
+  const url = urls[state.sourceUrlIndex % urls.length];
+  state.sourceUrlIndex = (state.sourceUrlIndex + 1) % urls.length;
+  state.sourceUrl = url;
+  return url;
+}
+
+// Re-fetch runtime config and navigate to the next source URL in 1..N order.
+// Called for every redirect navigation (start, retry, reward loop, watchdog, dropout).
+async function navigateNextSourceUrl(tabId) {
+  const { sourceUrls, successRate } = await getConfig();
+  state.sourceUrls = sourceUrls;
+  state.successRate = successRate;
+  const sourceUrl = advanceSourceUrl();
+  await persist();
+  await chrome.tabs.update(tabId, { url: sourceUrl });
+  return sourceUrl;
+}
+
+// Decide whether this funnel attempt completes or drops off mid-way (boredom).
+// `dropoutAt` names the last phase the simulated user finishes before leaving.
+const DROP_POINTS = ["email", "registration", "survey_partial", "survey_complete", "tcpa"];
+
+function planFunnelRun(successRate) {
+  if (Math.random() * 100 < successRate) {
+    return { willComplete: true };
+  }
+  const dropoutAt = DROP_POINTS[Math.floor(Math.random() * DROP_POINTS.length)];
+  const plan = { willComplete: false, dropoutAt };
+  if (dropoutAt === "survey_partial") {
+    plan.surveyQuestionLimit = 1 + Math.floor(Math.random() * 8);
+  }
+  return plan;
 }
 
 async function start() {
@@ -176,7 +229,6 @@ async function start() {
     status("No active tab to drive.", "fail");
     return;
   }
-  const sourceUrl = await getSourceUrl(); // from .env via /api/config (or fallback)
   // Fresh run => drop the previous identity so a new one is issued on the
   // first request from this run's content script (one identity per funnel).
   state = {
@@ -187,17 +239,20 @@ async function start() {
     unknown: 0,
     identity: null,
     details: null,
-    sourceUrl, // reused for retries + reward-restart this run
+    sourceUrls: [SOURCE_URL],
+    sourceUrlIndex: 0, // Start from URL #1 on each explicit run start
+    sourceUrl: SOURCE_URL,
+    successRate: DEFAULT_SUCCESS_RATE,
+    funnelPlan: null,
     lastProgressAt: Date.now(),
     recoveries: 0,
   };
   await chrome.storage.local.remove(["identity", "details"]);
-  await persist();
   // Arm the durable watchdog for the life of this run (create replaces any
   // existing alarm of the same name, so there's never a duplicate).
   await chrome.alarms.create(WATCHDOG_ALARM, { periodInMinutes: WATCHDOG_PERIOD_MIN });
-  await chrome.tabs.update(active.id, { url: sourceUrl });
-  status("Started — loading source URL in this tab…", "run");
+  const url = await navigateNextSourceUrl(active.id);
+  status(`Started — loading source URL (${shortHost(url)}) in this tab…`, "run");
 }
 
 async function stop() {
@@ -239,8 +294,8 @@ let recovering = false; // guards recoverStall() against overlapping watchdog ti
 async function onFunnelComplete(url) {
   if (restarting) return;
   restarting = true;
-  status(`Funnel complete (${shortHost(url)}) — looping again in ${RESTART_DELAY_MS / 1000}s…`, "ok");
-  await sleep(RESTART_DELAY_MS);
+  status(`Funnel complete (${shortHost(url)}) — looping again in ${REWARD_PAGE_DELAY_MS / 1000}s…`, "ok");
+  await sleep(REWARD_PAGE_DELAY_MS);
   if (state.sessionActive && state.tabId != null) {
     await beginFreshRun(state.tabId); // fresh identity, same tab + session, loop again
     status("Restarted — loading source URL…", "run");
@@ -261,11 +316,12 @@ async function beginFreshRun(tabId) {
     unknown: 0,
     identity: null,
     details: null,
+    funnelPlan: null,
     lastProgressAt: Date.now(),
   };
   await chrome.storage.local.remove(["identity", "details"]);
-  await persist();
-  await chrome.tabs.update(tabId, { url: state.sourceUrl || SOURCE_URL });
+  const url = await navigateNextSourceUrl(tabId);
+  status(`Loading next source URL (${shortHost(url)})…`, "run");
 }
 
 function scheduleEvaluate() {
@@ -303,10 +359,15 @@ async function evaluate() {
 async function onSuccess(url) {
   await stop(); // landed — the redirect loop is done
   markProgress(); // hand-off to the funnel stage; content-script heartbeats take over
+  state.funnelPlan = planFunnelRun(state.successRate);
   await persist();
+  const planNote = state.funnelPlan.willComplete
+    ? "will complete"
+    : `will dropout after ${state.funnelPlan.dropoutAt}`;
+  log(`funnel plan for ${shortHost(state.sourceUrl)}: ${planNote}`);
   // No manual injection needed: content.js is a declared content script on
   // *.uplevelrewards.com, so it auto-runs here AND on every later funnel page.
-  status(`Reached target — running funnel on ${shortHost(url)}.`, "ok");
+  status(`Reached target — running funnel on ${shortHost(url)} (${planNote}).`, "ok");
 }
 
 // --- identity (one per funnel run, reused across its pages) ------------
@@ -376,8 +437,8 @@ async function onFailure(url) {
   // Wait, then re-navigate the SAME tab back to the source to retry the chain.
   setTimeout(() => {
     if (!state.running) return;
-    chrome.tabs.update(state.tabId, { url: state.sourceUrl || SOURCE_URL }).catch((e) => {
-      status(`Could not re-navigate: ${e.message}`, "fail");
+    navigateNextSourceUrl(state.tabId).catch((e) => {
+      status(`Could not re-navigate to next source URL: ${e.message}`, "fail");
       stop();
     });
   }, RETRY_DELAY_MS);
@@ -406,6 +467,14 @@ function shortHost(url) {
     return new URL(url).host;
   } catch {
     return url.slice(0, 40);
+  }
+}
+
+function getAffiliateId(url) {
+  try {
+    return new URL(url).searchParams.get("aff_id") || null;
+  } catch {
+    return null;
   }
 }
 
@@ -442,6 +511,39 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
     status(`Scraped ${req.data?.fieldCount ?? 0} fields from target.`, "ok");
     sendResponse?.({ ok: true });
     return; // sync response
+  }
+  if (req.type === "funnel-check") {
+    const plan = state.funnelPlan;
+    if (!plan || plan.willComplete) {
+      sendResponse?.({ dropout: false });
+      return;
+    }
+    if (plan.dropoutAt === "survey_partial") {
+      const answered = req.questionsAnswered ?? 0;
+      sendResponse?.({
+        dropout: req.phase === "survey" && answered >= (plan.surveyQuestionLimit ?? 1),
+      });
+      return;
+    }
+    sendResponse?.({ dropout: plan.dropoutAt === req.phase });
+    return;
+  }
+  if (req.type === "funnel-dropout") {
+    const phase = req.phase || "unknown";
+    markProgress();
+    status(
+      `User lost interest after ${phase} — next source URL in ${RESTART_DELAY_MS / 1000}s…`,
+      "info"
+    );
+    (async () => {
+      await sleep(RESTART_DELAY_MS);
+      if (state.sessionActive && state.tabId != null) {
+        await beginFreshRun(state.tabId);
+        status("Restarted — loading next source URL…", "run");
+      }
+    })();
+    sendResponse?.({ ok: true });
+    return;
   }
   if (req.type === "get-identity") {
     markProgress();
@@ -507,6 +609,15 @@ chrome.runtime.onMessage.addListener((req, _sender, sendResponse) => {
       hasIdentity: !!state.identity,
       hasDetails: !!state.details,
       sourceUrl: state.sourceUrl,
+      sourceUrls: state.sourceUrls,
+      sourceUrlIndex: state.sourceUrlIndex,
+      sourceUrlNumber: state.sourceUrls?.length
+        ? ((state.sourceUrlIndex - 1 + state.sourceUrls.length) % state.sourceUrls.length) + 1
+        : 1,
+      sourceUrlCount: state.sourceUrls?.length ?? 1,
+      affiliateId: getAffiliateId(state.sourceUrl),
+      successRate: state.successRate,
+      funnelPlan: state.funnelPlan,
     });
     return; // sync
   }

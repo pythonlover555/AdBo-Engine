@@ -57,6 +57,8 @@ const dbg = {
   unknown: document.getElementById("dbg-unknown"),
   recoveries: document.getElementById("dbg-recoveries"),
   identity: document.getElementById("dbg-identity"),
+  urlnum: document.getElementById("dbg-urlnum"),
+  affid: document.getElementById("dbg-affid"),
   tabid: document.getElementById("dbg-tabid"),
 };
 let lastRecoveries = null;
@@ -85,6 +87,8 @@ function renderDebug(res) {
   lastRecoveries = res.recoveries ?? lastRecoveries;
 
   dbg.identity.textContent = res.hasIdentity ? (res.hasDetails ? "set (+details)" : "set") : "none";
+  dbg.urlnum.textContent = res.sourceUrlCount ? `${res.sourceUrlNumber} / ${res.sourceUrlCount}` : "—";
+  dbg.affid.textContent = res.affiliateId ?? "—";
   dbg.tabid.textContent = res.tabId ?? "—";
 }
 

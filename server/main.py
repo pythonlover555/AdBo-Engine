@@ -16,18 +16,19 @@ Run:  python run_server.py     (or: uvicorn server.main:app --port 8137)
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import identities
-from .config import PORT, SOURCE_URL
+from .config import PORT, SOURCE_URL, SOURCE_URLS, SUCCESS_RATE
 from .logging_setup import get_logger
 
 # Project version. Format x.x.x.x; bump the last segment per release
 # (1.0.0.0 -> 1.0.0.1 -> ...). Keep in sync with nav-extension/manifest.json.
-VERSION = "1.0.0.28"
+VERSION = "1.0.0.33"
 
 log = get_logger("main")
 
@@ -64,9 +65,17 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/config")
 async def config() -> dict[str, Any]:
-    """Runtime config the extension reads at Start. `source_url` (from
-    ADBO_SOURCE_URL in .env) is the URL it loads to begin the redirect loop."""
-    return {"ok": True, "source_url": SOURCE_URL}
+    """Runtime config the extension reads at Start.
+
+    `source_urls` lists every ADBO_SOURCE_URL_N from .env (cycled one per run).
+    `success_rate` is the target percentage of runs that reach the reward page.
+  """
+    return {
+        "ok": True,
+        "source_url": SOURCE_URL,
+        "source_urls": SOURCE_URLS,
+        "success_rate": SUCCESS_RATE,
+    }
 
 
 @app.get("/api/identity")
@@ -100,6 +109,17 @@ async def details() -> dict[str, Any]:
 # browser's extension polls GET /api/start-signal on its own alarm and starts
 # a run if the number it sees is new AND it isn't already running.
 _start_signal = 0
+
+
+class _HideStartSignalAccessLog(logging.Filter):
+    """Every open browser hits this endpoint every ~10-30s, which would
+    otherwise spam the terminal's uvicorn access log with nothing useful."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/start-signal" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_HideStartSignalAccessLog())
 
 
 @app.get("/api/start-signal")
